@@ -155,7 +155,7 @@ public class LibaioStressTest {
       while (true) {
          count ++;
 
-         if (count % 100_000 == 0) {
+         if (count % 1000 == 0) {
             System.out.println("Count " + count);
          }
          MyClass myClass = deque.poll();
