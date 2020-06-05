@@ -49,7 +49,7 @@ public class LibaioStressTest {
     * This is just an arbitrary number for a number of elements you need to pass to the libaio init method
     * Some of the tests are using half of this number, so if anyone decide to change this please use an even number.
     */
-   private static final int LIBAIO_QUEUE_SIZE = 1_000_000;
+   private static final int LIBAIO_QUEUE_SIZE = 5_000;
 
    @Rule
    public TemporaryFolder temporaryFolder;
