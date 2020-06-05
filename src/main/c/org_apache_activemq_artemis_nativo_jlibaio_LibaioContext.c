@@ -525,6 +525,8 @@ JNIEXPORT jobject JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_Libaio
         return NULL;
     }
 
+    fprintf (stderr, "queueSize %d\n", queueSize);
+
 	int res = io_queue_init(queueSize, &theControl->ioContext);
 	if (res) {
 		// Error, so need to release whatever was done before
