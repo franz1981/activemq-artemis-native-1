@@ -58,7 +58,7 @@ public class LibaioStressTest {
 
    @Before
    public void setUpFactory() {
-      control = new LibaioContext<>(LIBAIO_QUEUE_SIZE, false, true);
+      control = new LibaioContext<>(LIBAIO_QUEUE_SIZE, true, true);
    }
 
    @After
