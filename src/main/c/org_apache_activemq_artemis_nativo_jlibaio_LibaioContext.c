@@ -107,14 +107,16 @@ static int user_io_getevents(io_context_t aio_ctx, unsigned int max,
 
        while (i < max) {
            head = ring->head;
+           mem_barrier();
 
            if (head == ring->tail) {
                /* There are no more completions */
                break;
            } else {
+               read_barrier();
                /* There is another completion to reap */
                events[i] = ring->events[head];
-               read_barrier();
+               store_barrier();
                ring->head = (head + 1) % ring->nr;
                i++;
            }
