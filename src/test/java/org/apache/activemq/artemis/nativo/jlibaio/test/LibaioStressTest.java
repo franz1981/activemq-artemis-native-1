@@ -152,8 +152,15 @@ public class LibaioStressTest {
 
       long count = 0;
 
+      long nextBreak = System.currentTimeMillis() + 1000;
+
       while (true) {
          count ++;
+
+         if (System.currentTimeMillis() > nextBreak) {
+            Thread.sleep(1000);
+            nextBreak = System.currentTimeMillis() + 1000;
+         }
 
          if (count % 1000 == 0) {
             System.out.println("Count " + count);
