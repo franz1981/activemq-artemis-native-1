@@ -163,8 +163,6 @@ jmethodID libaioContextDone = NULL;
 jclass libaioContextClass = NULL;
 jclass runtimeExceptionClass = NULL;
 jclass ioExceptionClass = NULL;
-jclass nioBufferClass = NULL;
-jfieldID nioBufferAddressFieldId = NULL;
 
 // util methods
 void throwRuntimeException(JNIEnv* env, char* message) {
@@ -318,13 +316,6 @@ jint JNI_OnLoad(JavaVM* vm, void* reserved) {
            return JNI_ERR;
         }
 
-        nioBufferClass = (*env)->FindClass(env, "java/nio/Buffer");
-        if (nioBufferClass == NULL) {
-           return JNI_ERR;
-        }
-        nioBufferClass = (jclass)(*env)->NewGlobalRef(env, (jobject)nioBufferClass);
-        nioBufferAddressFieldId = (*env)->GetFieldID(env, nioBufferClass, "address", "J");
-
         return JNI_VERSION_1_6;
     }
 }
@@ -370,10 +361,6 @@ void JNI_OnUnload(JavaVM* vm, void* reserved) {
         if (libaioContextClass != NULL) {
             (*env)->DeleteGlobalRef(env, (jobject)libaioContextClass);
         }
-
-        if (nioBufferClass != NULL) {
-            (*env)->DeleteGlobalRef(env, (jobject)nioBufferClass);
-        }
     }
 }
 
@@ -384,8 +371,7 @@ JNIEXPORT void JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioCon
 
 
 static inline struct io_control * getIOControl(JNIEnv* env, jobject pointer) {
-    jlong address = (*env)->GetLongField(env, pointer, nioBufferAddressFieldId);
-    struct io_control * ioControl = (struct io_control *) address;
+    struct io_control * ioControl = (struct io_control *) (*env)->GetDirectBufferAddress(env, pointer);
     if (ioControl == NULL) {
        throwRuntimeException(env, "Controller not initialized");
     }
@@ -453,7 +439,7 @@ static inline short submit(JNIEnv * env, struct io_control * theControl, struct 
 }
 
 static inline void * getBuffer(JNIEnv* env, jobject pointer) {
-    return (void *) (*env)->GetLongField(env, pointer, nioBufferAddressFieldId);;
+    return (*env)->GetDirectBufferAddress(env, pointer);
 }
 
 JNIEXPORT jboolean JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioContext_lock
@@ -510,7 +496,8 @@ JNIEXPORT jobject JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_Libaio
         return NULL;
     }
 
-    fprintf (stderr, "queueSize %d\n", queueSize);
+    fprintf (stderr, "this artemis-native binary is a dev version only intended for testing, do not using in production! info: queueSize %d\n", queueSize);
+    fprintf (stdout, "this artemis-native binary is a dev version only intended for testing, do not using in production! info: queueSize %d\n", queueSize);
 
 	int res = io_queue_init(queueSize, &theControl->ioContext);
 	if (res) {
@@ -896,7 +883,7 @@ JNIEXPORT void JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioCon
        throwRuntimeException(env, "Null pointer");
        return;
     }
-  	void *  buffer = getBuffer(env, jbuffer);
+  	void *  buffer = (*env)->GetDirectBufferAddress(env, jbuffer);
   	free(buffer);
 }
 
@@ -1011,7 +998,7 @@ JNIEXPORT void JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioCon
     #ifdef DEBUG
         fprintf (stdout, "Mem setting buffer with %d bytes\n", size);
     #endif
-    void * buffer = getBuffer(env, jbuffer);
+    void * buffer = (*env)->GetDirectBufferAddress(env, jbuffer);
 
     if (buffer == 0)
     {
