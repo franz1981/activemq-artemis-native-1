@@ -140,7 +140,8 @@ public class LibaioStressTest {
       // ByteBuffer buffer = ByteBuffer.allocateDirect(4096);
       ByteBuffer buffer = LibaioContext.newAlignedBuffer(4096, 4096);
 
-      fileDescriptor.fill(4096, 4096 * 1000);
+      int maxSize = 4096 * 1000;
+      fileDescriptor.fill(4096, maxSize);
       for (int i = 0; i < 4096; i++) {
          buffer.put((byte) 'a');
       }
@@ -149,11 +150,21 @@ public class LibaioStressTest {
 
       int pos = 0;
 
-      while (true) {
+      long count = 0;
 
+      while (true) {
+         count ++;
+
+         if (count % 10_000 == 0) {
+            System.out.println("Count " + count);
+         }
          MyClass myClass = deque.poll();
          fileDescriptor.write(pos, 4096, buffer, myClass);
          pos += 4096;
+
+         if (pos >= maxSize) {
+            pos = 0;
+         }
 
       }
    }
