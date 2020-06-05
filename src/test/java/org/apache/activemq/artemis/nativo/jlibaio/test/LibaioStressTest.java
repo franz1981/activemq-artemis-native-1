@@ -58,7 +58,7 @@ public class LibaioStressTest {
 
    @Before
    public void setUpFactory() {
-      control = new LibaioContext<>(LIBAIO_QUEUE_SIZE, false, false);
+      control = new LibaioContext<>(LIBAIO_QUEUE_SIZE, false, true);
    }
 
    @After
@@ -140,7 +140,7 @@ public class LibaioStressTest {
       // ByteBuffer buffer = ByteBuffer.allocateDirect(4096);
       ByteBuffer buffer = LibaioContext.newAlignedBuffer(4096, 4096);
 
-      int maxSize = 4096 * 1000;
+      int maxSize = 4096 * LIBAIO_QUEUE_SIZE;
       fileDescriptor.fill(4096, maxSize);
       for (int i = 0; i < 4096; i++) {
          buffer.put((byte) 'a');
@@ -155,7 +155,7 @@ public class LibaioStressTest {
       while (true) {
          count ++;
 
-         if (count % 10_000 == 0) {
+         if (count % 100_000 == 0) {
             System.out.println("Count " + count);
          }
          MyClass myClass = deque.poll();
