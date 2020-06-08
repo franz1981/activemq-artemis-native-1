@@ -85,7 +85,7 @@ struct aio_ring {
 	unsigned	header_length;	/* size of aio_ring */
 
 
-	struct io_event		events[0];
+	struct io_event		io_events[0];
 }; /* 128 bytes + ring size */
 
 // Check if the implementation supports AIO_RING by checking this number directly.
@@ -98,32 +98,6 @@ static inline int has_usable_ring(struct aio_ring *ring) {
 static inline struct aio_ring* to_aio_ring(io_context_t aio_ctx) {
     return (struct aio_ring*) aio_ctx;
 }
-static int user_io_getevents(io_context_t aio_ctx, unsigned int max,
-                    struct io_event *events)
-   {
-       long i = 0;
-       unsigned head;
-       struct aio_ring *ring = to_aio_ring(aio_ctx);
-
-       while (i < max) {
-           head = ring->head;
-           mem_barrier();
-
-           if (head == ring->tail) {
-               /* There are no more completions */
-               break;
-           } else {
-               read_barrier();
-               /* There is another completion to reap */
-               events[i] = ring->events[head];
-               store_barrier();
-               ring->head = (head + 1) % ring->nr;
-               i++;
-           }
-       }
-
-       return i;
-   }
 
 //It implements a user space batch read io events implementation that attempts to read io avoiding any sys calls
 // This implementation will look at the internal structure (aio_ring) and move along the memory result
@@ -132,10 +106,50 @@ static int ringio_get_events(io_context_t aio_ctx, long min_nr, long max,
     struct aio_ring *ring = to_aio_ring(aio_ctx);
     //checks if it could be completed in user space, saving a sys call
     if (has_usable_ring(ring)) {
-        int used = user_io_getevents(aio_ctx, max, events);
-        if (used > 0) {
-           return used;
+        const unsigned ring_nr = ring->nr;
+        // We're assuming to be the exclusive writer to head, so we just need a compiler barrier
+        unsigned head = ring->head;
+        mem_barrier();
+        const unsigned tail = ring->tail;
+        int available = tail - head;
+        if (available < 0) {
+            //a wrap has occurred
+            available += ring_nr;
         }
+        #ifdef DEBUG
+            fprintf(stdout, "tail = %d head= %d nr = %d available = %d\n", tail, head, ring_nr, available);
+        #endif
+        if ((available >= min_nr) || (timeout && timeout->tv_sec == 0 && timeout->tv_nsec == 0)) {
+            if (!available) {
+                return 0;
+            }
+            //the kernel has written ring->tail from an interrupt:
+            //we need to load acquire the completed events here
+            read_barrier();
+            const int available_nr = available < max? available : max;
+            //if isn't needed to wrap we can avoid % operations that are quite expansive
+            const int needMod = ((head + available_nr) >= ring_nr) ? 1 : 0;
+            for (int i = 0; i<available_nr; i++) {
+                events[i] = ring->io_events[head];
+                if (needMod == 1) {
+                    head = (head + 1) % ring_nr;
+                } else {
+                    head = (head + 1);
+                }
+            }
+            //it allow the kernel to build its own view of the ring buffer size
+            //and push new events if there are any
+            store_barrier();
+            ring->head = head;
+            #ifdef DEBUG
+                fprintf(stdout, "consumed non sys-call = %d\n", available_nr);
+            #endif
+            return available_nr;
+        }
+    } else {
+        #ifdef DEBUG
+            fprintf(stdout, "The kernel is not supoprting the ring buffer any longer\n");
+        #endif
     }
     int sys_call_events = io_getevents(aio_ctx, min_nr, max, events, timeout);
     #ifdef DEBUG

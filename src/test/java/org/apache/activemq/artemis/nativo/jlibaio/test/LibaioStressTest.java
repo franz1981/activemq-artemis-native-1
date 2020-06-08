@@ -120,22 +120,42 @@ public class LibaioStressTest {
 
       t.start();
 
-      Thread t2 = new Thread() {
-         @Override
-         public void run() {
-            while (true) {
-               try {
-                  Thread.sleep(1000);
-               } catch (Exception e) {
-               }
-               System.gc();
+
+      Thread t2 = new Thread(() -> {
+         while (true) {
+            try {
+               Thread.sleep(1000);
+            } catch (Exception e) {
             }
+            System.gc();
          }
-      };
+      });
 
       t2.start();
 
-      LibaioFile fileDescriptor = control.openFile(temporaryFolder.newFile("test.bin"), true);
+      //startThread("test.bin");
+      Thread test2 = startThread("test_2.bin");
+      test2.join();
+      return;
+   }
+
+   private Thread startThread(String name) {
+      Thread t_test = new Thread( () -> {
+         try {
+            doFile(name);
+         } catch (IOException e) {
+            e.printStackTrace();
+         } catch (InterruptedException e) {
+            e.printStackTrace();
+         }
+      });
+      t_test.start();
+
+      return t_test;
+   }
+
+   private void doFile(String fileName) throws IOException, InterruptedException {
+      LibaioFile fileDescriptor = control.openFile(temporaryFolder.newFile(fileName), true);
 
       // ByteBuffer buffer = ByteBuffer.allocateDirect(4096);
       ByteBuffer buffer = LibaioContext.newAlignedBuffer(4096, 4096);
@@ -163,7 +183,7 @@ public class LibaioStressTest {
          }
 
          if (count % 100_000 == 0) {
-            System.out.println("Count " + count);
+            System.out.println("Count " + fileName + " :: " + count);
          }
          MyClass myClass = deque.poll();
          fileDescriptor.write(pos, 4096, buffer, myClass);
