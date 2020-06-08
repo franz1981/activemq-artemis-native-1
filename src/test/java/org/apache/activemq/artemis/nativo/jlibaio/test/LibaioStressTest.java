@@ -30,6 +30,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.activemq.artemis.nativo.jlibaio.LibaioContext;
 import org.apache.activemq.artemis.nativo.jlibaio.LibaioFile;
 import org.apache.activemq.artemis.nativo.jlibaio.SubmitInfo;
+import org.apache.activemq.artemis.nativo.jlibaio.util.CallbackCache;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Assume;
@@ -89,7 +90,8 @@ public class LibaioStressTest {
       fileDescriptor.close();
    }
 
-   LinkedBlockingDeque<MyClass> deque = new LinkedBlockingDeque(LIBAIO_QUEUE_SIZE + 100);
+
+   CallbackCache<MyClass>  callbackCache = new CallbackCache<>(LIBAIO_QUEUE_SIZE);
 
    class MyClass implements SubmitInfo {
 
@@ -100,16 +102,12 @@ public class LibaioStressTest {
 
       @Override
       public void done() {
-         deque.add(this);
+         callbackCache.put(this);
       }
    }
 
    @Test
    public void testSubmitWriteAndRead() throws Exception {
-
-      for (int i = 0; i < LIBAIO_QUEUE_SIZE + 100; i++) {
-         deque.add(new MyClass());
-      }
 
       Thread t = new Thread() {
          @Override
@@ -133,7 +131,7 @@ public class LibaioStressTest {
 
       t2.start();
 
-      //startThread("test.bin");
+      startThread("test.bin");
       Thread test2 = startThread("test_2.bin");
       test2.join();
       return;
@@ -185,7 +183,11 @@ public class LibaioStressTest {
          if (count % 1_000 == 0) {
             System.out.println("Count " + fileName + " :: " + count);
          }
-         MyClass myClass = deque.poll();
+         MyClass myClass = callbackCache.get();
+
+         if (myClass == null) {
+            myClass = new MyClass();
+         }
 
          if (count % 4 == 0) {
             Thread.sleep(100);
