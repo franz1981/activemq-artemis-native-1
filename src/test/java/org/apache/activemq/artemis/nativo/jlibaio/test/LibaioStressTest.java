@@ -25,12 +25,14 @@ import java.nio.ByteBuffer;
 import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.activemq.artemis.nativo.jlibaio.LibaioContext;
 import org.apache.activemq.artemis.nativo.jlibaio.LibaioFile;
 import org.apache.activemq.artemis.nativo.jlibaio.SubmitInfo;
 import org.apache.activemq.artemis.nativo.jlibaio.util.CallbackCache;
+import org.apache.activemq.artemis.nativo.jlibaio.util.ReusableLatch;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Assume;
@@ -50,7 +52,7 @@ public class LibaioStressTest {
     * This is just an arbitrary number for a number of elements you need to pass to the libaio init method
     * Some of the tests are using half of this number, so if anyone decide to change this please use an even number.
     */
-   private static final int LIBAIO_QUEUE_SIZE = 5_000;
+   private static final int LIBAIO_QUEUE_SIZE = 4096;
 
    @Rule
    public TemporaryFolder temporaryFolder;
@@ -59,7 +61,7 @@ public class LibaioStressTest {
 
    @Before
    public void setUpFactory() {
-      control = new LibaioContext<>(LIBAIO_QUEUE_SIZE, true, true);
+      control = new LibaioContext<>(LIBAIO_QUEUE_SIZE, true, false);
    }
 
    @After
@@ -95,6 +97,8 @@ public class LibaioStressTest {
 
    class MyClass implements SubmitInfo {
 
+      ReusableLatch reusableLatch;
+
       @Override
       public void onError(int errno, String message) {
 
@@ -102,7 +106,14 @@ public class LibaioStressTest {
 
       @Override
       public void done() {
-         callbackCache.put(this);
+         try {
+            reusableLatch.countDown();
+            reusableLatch = null;
+            callbackCache.put(this);
+         } catch (Throwable e) {
+            e.printStackTrace();
+            System.exit(-1);
+         }
       }
    }
 
@@ -153,7 +164,10 @@ public class LibaioStressTest {
    }
 
    private void doFile(String fileName) throws IOException, InterruptedException {
-      LibaioFile fileDescriptor = control.openFile(temporaryFolder.newFile(fileName), true);
+      ReusableLatch latchWrites = new ReusableLatch(0);
+
+      File file = temporaryFolder.newFile(fileName);
+      LibaioFile fileDescriptor = control.openFile(file, true);
 
       // ByteBuffer buffer = ByteBuffer.allocateDirect(4096);
       ByteBuffer buffer = LibaioContext.newAlignedBuffer(4096, 4096);
@@ -170,14 +184,24 @@ public class LibaioStressTest {
 
       long count = 0;
 
-      long nextBreak = System.currentTimeMillis() + 1000;
+      long nextBreak = System.currentTimeMillis() + 3000;
 
       while (true) {
          count ++;
 
          if (System.currentTimeMillis() > nextBreak) {
+            System.out.println("reopning file " + fileName + " latchWrites = " + latchWrites.getCount());
+            if (!latchWrites.await(10, TimeUnit.SECONDS)) {
+               System.err.println("Latch did not complete for some reason");
+               System.exit(-1);
+            }
+            System.out.println("latch count = " + latchWrites.getCount());
+            fileDescriptor.close();
+
+            fileDescriptor = control.openFile(file, true);
+            pos = 0;
             //Thread.sleep(1000);
-            nextBreak = System.currentTimeMillis() + 1000;
+            nextBreak = System.currentTimeMillis() + 5000;
          }
 
          if (count % 1_000 == 0) {
@@ -188,6 +212,10 @@ public class LibaioStressTest {
          if (myClass == null) {
             myClass = new MyClass();
          }
+
+         myClass.reusableLatch = latchWrites;
+         myClass.reusableLatch.countUp();
+
 
          if (count % 100 == 0) {
             Thread.sleep(100);
