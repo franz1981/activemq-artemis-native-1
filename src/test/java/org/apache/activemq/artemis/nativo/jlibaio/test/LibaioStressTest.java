@@ -189,7 +189,7 @@ public class LibaioStressTest {
             myClass = new MyClass();
          }
 
-         if (count % 4 == 0) {
+         if (count % 100 == 0) {
             Thread.sleep(100);
          }
          fileDescriptor.write(pos, 4096, buffer, myClass);

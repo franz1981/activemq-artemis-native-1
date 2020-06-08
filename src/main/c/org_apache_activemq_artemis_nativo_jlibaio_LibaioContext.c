@@ -98,6 +98,9 @@ static inline int has_usable_ring(struct aio_ring *ring) {
 static inline struct aio_ring* to_aio_ring(io_context_t aio_ctx) {
     return (struct aio_ring*) aio_ctx;
 }
+long usedring = 0;
+long useduser = 0;
+long usedinvalid = 0;
 
 //It implements a user space batch read io events implementation that attempts to read io avoiding any sys calls
 // This implementation will look at the internal structure (aio_ring) and move along the memory result
@@ -144,12 +147,20 @@ static int ringio_get_events(io_context_t aio_ctx, long min_nr, long max,
             #ifdef DEBUG
                 fprintf(stdout, "consumed non sys-call = %d\n", available_nr);
             #endif
+            usedring ++;
             return available_nr;
         }
     } else {
         #ifdef DEBUG
             fprintf(stdout, "The kernel is not supoprting the ring buffer any longer\n");
         #endif
+    }
+    useduser++;
+
+    if (useduser % 100 == 0 || usedring % 100 == 0) {
+        fprintf (stderr, "used ring = %ld, used user = %ld, invalid usages = %ld\n", usedring, useduser, usedinvalid);
+        fflush(stderr);
+
     }
     int sys_call_events = io_getevents(aio_ctx, min_nr, max, events, timeout);
     #ifdef DEBUG
@@ -592,7 +603,7 @@ JNIEXPORT jobject JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_Libaio
 }
 
 JNIEXPORT void JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioContext_deleteContext(JNIEnv* env, jclass clazz, jobject contextPointer) {
-    int i;
+    //int i;
     struct io_control * theControl = getIOControl(env, contextPointer);
     if (theControl == NULL) {
       return;
@@ -617,12 +628,12 @@ JNIEXPORT void JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioCon
     pthread_mutex_unlock(&(theControl->pollLock));
 
     // To return any pending IOCBs
-    int result = ringio_get_events(theControl->ioContext, 0, 1, theControl->events, 0);
+    /* int result = ringio_get_events(theControl->ioContext, 0, 1, theControl->events, 0);
     for (i = 0; i < result; i++) {
         struct io_event * event = &(theControl->events[i]);
         struct iocb * iocbp = event->obj;
         putIOCB(theControl, iocbp);
-    }
+    } */
 
     io_queue_release(theControl->ioContext);
 
@@ -814,6 +825,7 @@ JNIEXPORT void JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioCon
                 // We delete the globalRef after the completion of the callback
                 (*env)->DeleteGlobalRef(env, obj);
             } else {
+               usedinvalid++;
                fprintf (stderr, "ouch!!!! it was null!!!!\b");
             }
 
