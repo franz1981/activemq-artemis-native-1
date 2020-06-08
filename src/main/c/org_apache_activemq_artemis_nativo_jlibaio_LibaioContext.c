@@ -817,7 +817,7 @@ JNIEXPORT void JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioCon
             }
 
             jobject obj = (jobject)iocbp->data;
-            iocbp->data = NULL;
+            //iocbp->data = NULL;
 
             if (obj != NULL) {
                 putIOCB(theControl, iocbp);
