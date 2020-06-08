@@ -178,14 +178,18 @@ public class LibaioStressTest {
          count ++;
 
          if (System.currentTimeMillis() > nextBreak) {
-            Thread.sleep(1000);
+            //Thread.sleep(1000);
             nextBreak = System.currentTimeMillis() + 1000;
          }
 
-         if (count % 100_000 == 0) {
+         if (count % 1_000 == 0) {
             System.out.println("Count " + fileName + " :: " + count);
          }
          MyClass myClass = deque.poll();
+
+         if (count % 4 == 0) {
+            Thread.sleep(100);
+         }
          fileDescriptor.write(pos, 4096, buffer, myClass);
          pos += 4096;
 

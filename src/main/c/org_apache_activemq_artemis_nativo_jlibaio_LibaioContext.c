@@ -807,9 +807,9 @@ JNIEXPORT void JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioCon
 
             jobject obj = (jobject)iocbp->data;
             iocbp->data = NULL;
-            putIOCB(theControl, iocbp);
 
             if (obj != NULL) {
+                putIOCB(theControl, iocbp);
                 (*env)->CallVoidMethod(env, theControl->thisObject, libaioContextDone,obj);
                 // We delete the globalRef after the completion of the callback
                 (*env)->DeleteGlobalRef(env, obj);
