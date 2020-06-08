@@ -803,7 +803,9 @@ JNIEXPORT void JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioCon
             }
 
             jobject obj = (jobject)iocbp->data;
-            //iocbp->data = NULL;
+
+            // @Jeff Moyer: if I remove this line, the system would crash:
+            iocbp->data = NULL;
 
             if (obj != NULL) {
                 putIOCB(theControl, iocbp);
@@ -812,7 +814,7 @@ JNIEXPORT void JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioCon
                 (*env)->DeleteGlobalRef(env, obj);
             } else {
                usedinvalid++;
-               fprintf (stderr, "ouch!!!! it was null!!!!\n");
+               fprintf (stderr, "ouch!!!! it was null!!!!, system would crash!!!! \n");
             }
 
         }
