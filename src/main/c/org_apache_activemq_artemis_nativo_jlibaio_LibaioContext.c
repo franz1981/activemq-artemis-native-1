@@ -799,6 +799,8 @@ JNIEXPORT void JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioCon
                 (*env)->CallVoidMethod(env, theControl->thisObject, libaioContextDone,obj);
                 // We delete the globalRef after the completion of the callback
                 (*env)->DeleteGlobalRef(env, obj);
+            } else {
+               fprintf (stderr, "ouch!!!! it was null!!!!\b");
             }
 
         }
