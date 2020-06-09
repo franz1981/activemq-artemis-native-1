@@ -38,8 +38,8 @@
 
 //x86 has a strong memory model and there is no need of HW fences if just Write-Back (WB) memory is used
 #define mem_barrier() __asm__ __volatile__ ("":::"memory")
-#define read_barrier()	__asm__ __volatile__("":::"memory")
-#define store_barrier()	__asm__ __volatile__("":::"memory")
+#define read_barrier()	__asm__ __volatile__("lfence":::"memory")
+#define store_barrier()	__asm__ __volatile__("sfence":::"memory")
 struct io_control {
     io_context_t ioContext;
     struct io_event * events;
@@ -112,12 +112,12 @@ static int user_io_getevents(io_context_t aio_ctx, unsigned int max,
        while (i < max) {
            head = ring->head;
            mem_barrier();
-
-           if (head == ring->tail) {
+           unsigned long tail = ring->tail;
+           read_barrier();
+           if (head == tail) {
                /* There are no more completions */
                break;
            } else {
-               read_barrier();
                /* There is another completion to reap */
                events[i] = ring->events[head];
                store_barrier();
