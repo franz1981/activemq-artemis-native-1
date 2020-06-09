@@ -38,8 +38,8 @@
 
 //x86 has a strong memory model and there is no need of HW fences if just Write-Back (WB) memory is used
 #define mem_barrier() __asm__ __volatile__ ("":::"memory")
-#define read_barrier()	__asm__ __volatile__("":::"memory")
-#define store_barrier()	__asm__ __volatile__("":::"memory")
+#define read_barrier()	__asm__ __volatile__("lfence":::"memory")
+#define store_barrier()	__asm__ __volatile__("sfence":::"memory")
 
 struct io_control {
     io_context_t ioContext;
@@ -112,6 +112,7 @@ static int ringio_get_events(io_context_t aio_ctx, long min_nr, long max,
         unsigned head = ring->head;
         mem_barrier();
         const unsigned tail = ring->tail;
+        read_barrier();
         int available = tail - head;
         if (available < 0) {
             //a wrap has occurred
@@ -126,7 +127,6 @@ static int ringio_get_events(io_context_t aio_ctx, long min_nr, long max,
             }
             //the kernel has written ring->tail from an interrupt:
             //we need to load acquire the completed events here
-            read_barrier();
             const int available_nr = available < max? available : max;
             //if isn't needed to wrap we can avoid % operations that are quite expansive
             const int needMod = ((head + available_nr) >= ring_nr) ? 1 : 0;
