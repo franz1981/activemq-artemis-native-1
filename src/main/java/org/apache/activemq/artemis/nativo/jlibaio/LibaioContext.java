@@ -20,11 +20,14 @@ import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+
+import sun.nio.ch.DirectBuffer;
 
 /**
  * This class is used as an aggregator for the {@link LibaioFile}.
@@ -178,6 +181,19 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
       } else {
          this.ioSpace = null;
       }
+   }
+
+   public AioRing toAioRing() {
+      final long ioContextAddress = ioContext.duplicate().order(ByteOrder.nativeOrder()).getLong(0);
+      if (!AioRing.hasUsableRing(ioContextAddress)) {
+         return null;
+      }
+      return new AioRing(ioContextAddress);
+   }
+
+   public long ioEventsAddress() {
+      // TODO: can be improved in a separate class
+      return ioContext.duplicate().order(ByteOrder.nativeOrder()).getLong(Long.BYTES);
    }
 
    /**

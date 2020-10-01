@@ -25,6 +25,7 @@ import java.nio.ByteBuffer;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.apache.activemq.artemis.nativo.jlibaio.AioRing;
 import org.apache.activemq.artemis.nativo.jlibaio.LibaioContext;
 import org.apache.activemq.artemis.nativo.jlibaio.LibaioFile;
 import org.apache.activemq.artemis.nativo.jlibaio.SubmitInfo;
@@ -240,6 +241,13 @@ public class LibaioTest {
 
          fileDescriptor.write(0, 4096, buffer, callback);
 
+         AioRing aioRing = control.toAioRing();
+         int size;
+         while ((size = aioRing.size()) == 0) {
+
+         }
+         Assert.assertEquals(1, size);
+         final int peek = aioRing.peek(control.ioEventsAddress());
          int retValue = control.poll(callbacks, 1, LIBAIO_QUEUE_SIZE);
          Assert.assertEquals(1, retValue);
 
