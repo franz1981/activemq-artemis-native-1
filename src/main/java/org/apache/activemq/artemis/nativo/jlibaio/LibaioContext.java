@@ -19,12 +19,27 @@ package org.apache.activemq.artemis.nativo.jlibaio;
 import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.nio.Buffer;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Objects;
+import java.util.Queue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
+
+import org.jctools.queues.MpmcArrayQueue;
+import org.jctools.queues.atomic.MpmcAtomicArrayQueue;
+import org.jctools.util.UnsafeAccess;
+import sun.misc.Unsafe;
 
 /**
  * This class is used as an aggregator for the {@link LibaioFile}.
@@ -47,13 +62,32 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
    /**
     * The Native layer will look at this version.
     */
-   private static final int EXPECTED_NATIVE_VERSION = 10;
+   private static final int EXPECTED_NATIVE_VERSION = 11;
 
    private static boolean loaded = false;
 
    private static final AtomicBoolean shuttingDown = new AtomicBoolean(false);
 
    private static final AtomicInteger contexts = new AtomicInteger(0);
+
+   private static final String FORCE_SYSCALL_PROPERTY_NAME = "org.apache.activemq.artemis.native.jlibaio.FORCE_SYSCALL";
+
+   private static final class PooledIOCB {
+
+      final int id;
+      final ByteBuffer bytes;
+      final long address;
+      final ArrayList<SubmitInfo> submissions;
+
+      PooledIOCB(int id, ByteBuffer iocbBytes) {
+         this.id = id;
+         assert iocbBytes.capacity() == IoCb.SIZE_OF();
+         assert iocbBytes.order() == ByteOrder.nativeOrder();
+         this.bytes = iocbBytes;
+         this.address = RuntimeDependent.directBufferAddress(bytes);
+         this.submissions = new ArrayList<>();
+      }
+   }
 
    public static boolean isLoaded() {
       return loaded;
@@ -77,11 +111,10 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
 
    static {
       String[] libraries = new String[]{"artemis-native-64", "artemis-native-32"};
-
       for (String library : libraries) {
          if (loadLibrary(library)) {
             loaded = true;
-            if (System.getProperty("org.apache.activemq.artemis.native.jlibaio.FORCE_SYSCALL") != null) {
+            if (System.getProperty(FORCE_SYSCALL_PROPERTY_NAME) != null) {
                LibaioContext.setForceSyscall(true);
             }
             Runtime.getRuntime().addShutdownHook(new Thread() {
@@ -96,7 +129,6 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
             NativeLogger.LOGGER.debug("Library " + library + " not found!");
          }
       }
-
       if (!loaded) {
          NativeLogger.LOGGER.debug("Couldn't locate LibAIO Wrapper");
       }
@@ -144,15 +176,19 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
    /**
     * the native ioContext including the structure created.
     */
-   private final ByteBuffer ioContext;
-
+   private final ByteBuffer ioControl;
+   private final long ioContextAddress;
    private final AtomicBoolean closed = new AtomicBoolean(false);
-
-   final Semaphore ioSpace;
-
-   final int queueSize;
-
-   final boolean useFdatasync;
+   private final Semaphore ioSpace;
+   private final int queueSize;
+   private final boolean useFdatasync;
+   private final Queue<PooledIOCB> iocbPool;
+   private final PooledIOCB[] iocbArray;
+   private final IoEventArray ioEventArray;
+   private final SubmitInfo[] submitted;
+   private final AioRing aioRing;
+   private final int dumbFD;
+   private final ReentrantLock pollLock;
 
    /**
     * The queue size here will use resources defined on the kernel parameter
@@ -166,8 +202,23 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
    public LibaioContext(int queueSize, boolean useSemaphore, boolean useFdatasync) {
       try {
          contexts.incrementAndGet();
-         this.ioContext = newContext(queueSize);
+         this.ioControl = newContext(queueSize);
+         // Better use JNI here, because the context address size depends on the machine word size
+         this.ioContextAddress = getIOContextAddress(ioControl);
+         this.iocbPool = RuntimeDependent.newMpmcQueue(queueSize);
+         this.iocbArray = new PooledIOCB[queueSize];
+         final IoCb.Array arrayOfIocb = new IoCb.Array(queueSize);
+         for (int i = 0; i < queueSize; i++) {
+            final PooledIOCB pooledIOCB = new PooledIOCB(i, arrayOfIocb.sliceOf(i));
+            this.iocbArray[i] = pooledIOCB;
+            this.iocbPool.add(pooledIOCB);
+         }
+         this.ioEventArray = new IoEventArray(queueSize);
          this.useFdatasync = useFdatasync;
+         this.submitted = new SubmitInfo[queueSize];
+         this.aioRing = createAioRing();
+         this.dumbFD = dumbFD();
+         this.pollLock = new ReentrantLock();
       } catch (Exception e) {
          throw e;
       }
@@ -180,40 +231,17 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
       }
    }
 
-   /**
-    * Documented at {@link LibaioFile#write(long, int, java.nio.ByteBuffer, SubmitInfo)}
-    *
-    * @param fd          the file descriptor
-    * @param position    the write position
-    * @param size        number of bytes to use
-    * @param bufferWrite the native buffer
-    * @param callback    a callback
-    * @throws IOException in case of error
-    */
-   public void submitWrite(int fd,
-                           long position,
-                           int size,
-                           ByteBuffer bufferWrite,
-                           Callback callback) throws IOException {
-      if (closed.get()) {
-         throw new IOException("Libaio Context is closed!");
+   private AioRing createAioRing() {
+      if (isForceSyscall()) {
+         return null;
       }
-      try {
-         if (ioSpace != null) {
-            ioSpace.acquire();
-         }
-      } catch (InterruptedException e) {
-         Thread.currentThread().interrupt();
-         throw new IOException(e.getMessage(), e);
+      if (!AioRing.hasUsableRing(ioContextAddress)) {
+         return null;
       }
-      submitWrite(fd, this.ioContext, position, size, bufferWrite, callback);
+      return new AioRing(ioContextAddress);
    }
 
-   public void submitRead(int fd,
-                          long position,
-                          int size,
-                          ByteBuffer bufferWrite,
-                          Callback callback) throws IOException {
+   public int submitWrite(int fd, long position, int size, ByteBuffer bufferWrite, Callback callback) throws IOException {
       if (closed.get()) {
          throw new IOException("Libaio Context is closed!");
       }
@@ -225,7 +253,56 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
          Thread.currentThread().interrupt();
          throw new IOException(e.getMessage(), e);
       }
-      submitRead(fd, this.ioContext, position, size, bufferWrite, callback);
+      PooledIOCB iocb = iocbPool.poll();
+      if (iocb == null) {
+         assert ioSpace == null;
+         throw new IOException("Not enough space in libaio queue");
+      }
+      try {
+         // set submitted *before* submitWrite in order to guarantee safe publication thanks to JNI
+         submitted[iocb.id] = callback;
+         submitWrite(fd, ioContextAddress, iocb.address, position, size, RuntimeDependent.directBufferAddress(bufferWrite), iocb.id);
+         return iocb.id;
+      } catch (IOException ioException) {
+         submitted[iocb.id] = null;
+         iocbPool.add(iocb);
+         if (ioSpace != null) {
+            ioSpace.release();
+         }
+         throw ioException;
+      }
+   }
+
+   public int submitRead(int fd, long position, int size, ByteBuffer bufferWrite, Callback callback) throws IOException {
+      if (closed.get()) {
+         throw new IOException("Libaio Context is closed!");
+      }
+      try {
+         if (ioSpace != null) {
+            ioSpace.acquire();
+         }
+      } catch (InterruptedException e) {
+         Thread.currentThread().interrupt();
+         throw new IOException(e.getMessage(), e);
+      }
+      PooledIOCB iocb = iocbPool.poll();
+      if (iocb == null) {
+         assert ioSpace == null;
+         throw new IOException("Not enough space in libaio queue");
+      }
+      try {
+         // set submitted *before* submitRead in order to guarantee safe publication thanks to JNI
+         submitted[iocb.id] = callback;
+         submitRead(fd, ioContextAddress, iocb.address, position, size, RuntimeDependent.directBufferAddress(bufferWrite), iocb.id);
+         return iocb.id;
+      } catch (IOException ioException) {
+         submitted[iocb.id] = null;
+         iocbPool.add(iocb);
+         if (ioSpace != null) {
+            ioSpace.release();
+         }
+         throw ioException;
+      }
    }
 
    /**
@@ -247,8 +324,45 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
          }
          totalMaxIO.addAndGet(-queueSize);
 
-         if (ioContext != null) {
-            deleteContext(ioContext);
+         if (ioControl != null) {
+            // submit a dumbFD write
+            PooledIOCB iocb = iocbPool.poll();
+            if (iocb == null) {
+               throw new IllegalStateException("Not enough space in libaio queue to stop the context");
+            }
+            try {
+               // Submitting a dumb write so the loop finishes
+               submitWrite(dumbFD, ioContextAddress, iocb.address, 0, 0, 0, iocb.id);
+            } catch (IOException ioException) {
+               // TODO handle this
+            }
+            // await until there are no more pending I/O or the blocked poll has completed
+            do {
+               pollLock.lock();
+               try {
+                  // poll is locked, will await any blocked pool to complete
+                  if (unsafePoll(null, 0, 1) == 0) {
+                     Thread.yield();
+                  }
+               } finally {
+                  pollLock.unlock();
+               }
+            } while (iocbPool.size() < queueSize);
+            deleteContext(ioControl);
+            pollLock.lock();
+            try {
+               if (iocb.bytes == null) {
+                  throw new NullPointerException("THIS IS IMPOSSIBLE: IT'S JUST TO CREATE AN REACHABILITY FENCE");
+               }
+               assert iocbPool.size() == queueSize;
+               iocbPool.clear();
+               Arrays.fill(submitted, null);
+               Arrays.fill(iocbArray, null);
+               ioEventArray.close();
+            } finally {
+               pollLock.unlock();
+            }
+
          }
          contexts.decrementAndGet();
          checkShutdown();
@@ -285,7 +399,7 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
     */
    public LibaioFile<Callback> openFile(String file, boolean direct) throws IOException {
       checkNotNull(file, "path");
-      checkNotNull(ioContext, "IOContext");
+      checkNotNull(ioControl, "IOContext");
 
       // note: the native layer will throw an IOException in case of errors
       int res = LibaioContext.open(file, direct);
@@ -322,32 +436,72 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
       return arg;
    }
 
-   /**
-    * It will poll the libaio queue for results. It should block until min is reached
-    * Results are placed on the callback.
-    * <br>
-    * This shouldn't be called concurrently. You should provide your own synchronization if you need more than one
-    * Thread polling for any reason.
-    * <br>
-    * Notice that the native layer will invoke {@link SubmitInfo#onError(int, String)} in case of failures,
-    * but it won't call done method for you.
-    *
-    * @param callbacks area to receive the callbacks passed on submission.The size of this callback has to
-    *                  be greater than the parameter max.
-    * @param min       the minimum number of elements to receive. It will block until this is achieved.
-    * @param max       The maximum number of elements to receive.
-    * @return Number of callbacks returned.
-    * @see LibaioFile#write(long, int, java.nio.ByteBuffer, SubmitInfo)
-    * @see LibaioFile#read(long, int, java.nio.ByteBuffer, SubmitInfo)
-    */
-   public int poll(Callback[] callbacks, int min, int max) {
-      int released = poll(ioContext, callbacks, min, max);
-      if (ioSpace != null) {
-         if (released > 0) {
-            ioSpace.release(released);
+   public int poll(SubmitInfo[] callbacks, int min, int max) {
+      if (min > max || min < 0 || max > queueSize) {
+         throw new IllegalArgumentException("cannot request more events then the configured queueSize");
+      }
+      if (closed.get()) {
+         return 0;
+      }
+      pollLock.lock();
+      try {
+         return unsafePoll(callbacks, min, max);
+      } finally {
+         pollLock.unlock();
+      }
+   }
+
+   private int unsafePoll(SubmitInfo[] callbacks, int min, int max) {
+      final AioRing aioRing = this.aioRing;
+      final IoEventArray ioEventArray = this.ioEventArray;
+      final Semaphore ioSpace = this.ioSpace;
+      final PooledIOCB[] iocbArray = this.iocbArray;
+      final SubmitInfo[] submitted = this.submitted;
+      final Queue<PooledIOCB> iocbPool = this.iocbPool;
+      final long ioContextAddress = this.ioContextAddress;
+      final long ioEventArrayAddress = ioEventArray.address();
+      int events = -1;
+      if (aioRing != null) {
+         events = aioRing.poll(ioEventArrayAddress, min, max);
+      }
+      if (events < min) {
+         // perform a blocking call
+         events = poll(ioContextAddress, ioEventArrayAddress, min, max);
+      }
+      assert events >= min && events <= max;
+      for (int i = 0; i < events; i++) {
+         final IoEventArray.IoEvent ioEvent = ioEventArray.get(i);
+         assert ioEvent.obj() != 0;
+         final int id = (int) ioEvent.data();
+         final PooledIOCB pooledIOCB = iocbArray[id];
+         assert ioEvent.obj() == pooledIOCB.address;
+         assert IoCb.aioData(pooledIOCB.bytes) == id;
+         SubmitInfo submitInfo = submitted[id];
+         if (submitInfo != null) {
+            submitted[id] = null;
+         }
+         // NOTE:
+         // First we return back the IOCB (and its id, because submitted[id] == null)
+         // Then we release the semaphore, to let "ideally" submitInfo::done
+         // to be able to issue a further write/read.
+         iocbPool.add(pooledIOCB);
+         if (ioSpace != null) {
+            ioSpace.release();
+         }
+         if (callbacks != null) {
+            // this could be NULL!
+            callbacks[i] = submitInfo;
+         }
+         if (submitInfo != null) {
+            final long res = ioEvent.res();
+            if (res >= 0) {
+               handleDone(submitInfo, pooledIOCB);
+            } else {
+               handleError(submitInfo, pooledIOCB, res);
+            }
          }
       }
-      return released;
+      return events;
    }
 
    /**
@@ -358,20 +512,208 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
     * {@link SubmitInfo#done()} are called.
     */
    public void poll() {
-      if (!closed.get()) {
-         blockedPoll(ioContext, useFdatasync);
+      if (closed.get()) {
+         return;
+      }
+      pollLock.lock();
+      try {
+         final int dumbFD = this.dumbFD;
+         final AioRing aioRing = this.aioRing;
+         final IoEventArray ioEventArray = this.ioEventArray;
+         final boolean useFdatasync = this.useFdatasync;
+         final Semaphore ioSpace = this.ioSpace;
+         final PooledIOCB[] iocbArray = this.iocbArray;
+         final SubmitInfo[] submitted = this.submitted;
+         final Queue<PooledIOCB> iocbPool = this.iocbPool;
+         final int queueSize = this.queueSize;
+         final long ioContextAddress = this.ioContextAddress;
+         final long ioEventArrayAddress = ioEventArray.address();
+         final FDataSyncBatcher batcher = new FDataSyncBatcher(ioContextAddress);
+         long completedFDSyncs = 0;
+         while (true) {
+            int events = 0;
+            if (aioRing != null) {
+               // we need to limit max, because that's the capacity of ioEventArray
+               events = aioRing.poll(ioEventArrayAddress, 0, queueSize);
+            } else {
+               events = poll(ioContextAddress, ioEventArrayAddress, 0, queueSize);
+            }
+            // it could be either a RHEL bug or no new events
+            if (events <= 0) {
+               final long pendingFDSyncs = batcher.submittedFDSyncs() - completedFDSyncs;
+               // try issue a new batch of fdatasync only if all the previous ones are completed
+               if (pendingFDSyncs == 0) {
+                  if (batcher.flushBatch()) {
+                     continue;
+                  }
+               }
+               events = poll(ioContextAddress, ioEventArrayAddress, 1, queueSize);
+            }
+            assert events > 0 && events <= queueSize;
+            boolean stop = false;
+            for (int i = 0; i < events; i++) {
+               final IoEventArray.IoEvent ioEvent = ioEventArray.get(i);
+               assert ioEvent.obj() != 0;
+               final int id = (int) ioEvent.data();
+               PooledIOCB pooledIOCB = iocbArray[id];
+               final ByteBuffer pooledIOCBBytes = pooledIOCB.bytes;
+               assert ioEvent.obj() == pooledIOCB.address;
+               assert IoCb.aioData(pooledIOCBBytes) == id;
+               SubmitInfo submitInfo = submitted[id];
+               final long res = ioEvent.res();
+               final short liOpCode = IoCb.lioOpCode(pooledIOCBBytes);
+               if (res >= 0) {
+                  final int fd = IoCb.aioFildes(pooledIOCBBytes);
+                  if (liOpCode == IoCb.IOCB_CMD_PWRITE) {
+                     if (fd == dumbFD) {
+                        stop = true;
+                     } else if (useFdatasync) {
+                        if (batcher.addCompletedWrite(submitInfo, pooledIOCB, fd)) {
+                           // release iocb and replenish IOPS, but prevent submitInfo to be tracked by id:
+                           // from now on it will be referenced on the batchingIOCB::submissions
+                           submitted[id] = null;
+                           submitInfo = null;
+                        } else {
+                           // allow to reuse the pooledIOCB and IOPS used for pwrite
+                           // while leaving submitInfo from being completed
+                           pooledIOCB = null;
+                           submitInfo = null;
+                        }
+                     }
+                  }
+                  // PREAD and FDSYNC just keep going
+               }
+               if (submitInfo != null) {
+                  submitted[id] = null;
+               }
+               // NOTE:
+               // First we return back the IOCB (and its id, because submitted[id] == null)
+               // Then we release the semaphore, to let "ideally" submitInfo::done
+               // to be able to issue a further write/read.
+               if (pooledIOCB != null) {
+                  // it's fine to return it back to the pool even if pooledIOCB::submissions isn't empty
+                  // because this Thread is the only one that can modify submissions and we're still dealing with them.
+                  // A submitter would just modify the direct buffer content of this, not the submissions!
+                  iocbPool.add(pooledIOCB);
+                  if (ioSpace != null) {
+                     ioSpace.release();
+                  }
+               }
+               if (submitInfo != null) {
+                  if (res >= 0) {
+                     handleDone(submitInfo, pooledIOCB);
+                  } else {
+                     handleError(submitInfo, pooledIOCB, res);
+                  }
+               }
+               if (liOpCode == IoCb.IOCB_CMD_FDSYNC) {
+                  completedFDSyncs++;
+               }
+            }
+            if (stop) {
+               // issue any pending fdatasync (if any)
+               batcher.flushBatch();
+               batcher.printStatistics();
+               return;
+            }
+         }
+      } finally {
+         pollLock.unlock();
       }
    }
 
-   /**
-    * Called from the native layer
-    */
-   private void done(SubmitInfo info) {
-      info.done();
-      if (ioSpace != null) {
-         ioSpace.release();
+   private static class FDataSyncBatcher {
+
+      private PooledIOCB batchingIOCB;
+      private int batchingFD = -1;
+      private final long ioContextAddress;
+      private long maxMeasuredBatchSize;
+      private long submittedFDSyncs;
+      private long totalMeasuredBatches;
+      private final boolean collectStatistics;
+
+      public FDataSyncBatcher(long ioContextAddress) {
+         this.ioContextAddress = ioContextAddress;
+         collectStatistics = true; //NativeLogger.LOGGER.isTraceEnabled();
       }
+
+      public boolean addCompletedWrite(SubmitInfo submitInfo, PooledIOCB pooledIOCB, int fd) {
+         if (fd == batchingFD) {
+            batchingIOCB.submissions.add(submitInfo);
+            return true;
+         }
+         flushBatch();
+         batchingIOCB = pooledIOCB;
+         batchingFD = fd;
+         return false;
+      }
+
+      public long submittedFDSyncs() {
+         return submittedFDSyncs;
+      }
+
+      public boolean flushBatch() {
+         if (batchingFD != -1) {
+            if (collectStatistics) {
+               totalMeasuredBatches += batchingIOCB.submissions.size();
+               maxMeasuredBatchSize = Math.max(batchingIOCB.submissions.size(), maxMeasuredBatchSize);
+            }
+            submittedFDSyncs++;
+            try {
+               submitFDataSync(batchingFD, ioContextAddress, batchingIOCB.address, batchingIOCB.id);
+               return true;
+            } catch (IOException ioException) {
+               NativeLogger.LOGGER.error("Impossible to submit an async fdatasync", ioException);
+               // TODO how to handle?
+            } finally {
+               batchingIOCB = null;
+               batchingFD = -1;
+            }
+         }
+         return false;
+      }
+
+      public void printStatistics() {
+         if (collectStatistics) {
+            NativeLogger.LOGGER.infof("total fdatasync requests = %d max batched writes = %d avg batch size = %d",
+                                      submittedFDSyncs, maxMeasuredBatchSize, (submittedFDSyncs > 0 ? totalMeasuredBatches / submittedFDSyncs : 0));
+         }
+      }
+
    }
+
+   private static void handleDone(SubmitInfo submitInfo, PooledIOCB pooledIOCB) {
+      submitInfo.done();
+      if (pooledIOCB == null) {
+         return;
+      }
+      final ArrayList<SubmitInfo> submissions = pooledIOCB.submissions;
+      for (int d = 0, size = submissions.size(); d < size; d++) {
+         submissions.get(d).done();
+      }
+      submissions.clear();
+   }
+
+   private static void handleError(SubmitInfo submitInfo, PooledIOCB pooledIOCB, long res) {
+      assert res < 0;
+      final int error = (int) -res;
+      final String errorMessage = strError(res);
+      submitInfo.onError(error, errorMessage);
+      if (pooledIOCB == null) {
+         return;
+      }
+      final ArrayList<SubmitInfo> submissions = pooledIOCB.submissions;
+      for (int d = 0, size = submissions.size(); d < size; d++) {
+         submissions.get(d).onError(error, errorMessage);
+      }
+      submissions.clear();
+   }
+
+   private static native String strError(long eventError);
+
+   private static native int dumbFD();
+
+   private static native long memoryAddress0(ByteBuffer buffer);
 
    /**
     * This is the queue for libaio, initialized with queueSize.
@@ -381,7 +723,7 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
    /**
     * Internal method to be used when closing the controller.
     */
-   private native void deleteContext(ByteBuffer buffer);
+   private static native void deleteContext(ByteBuffer buffer);
 
    /**
     * it will return a file descriptor.
@@ -415,25 +757,26 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
     */
    public static native void freeBuffer(ByteBuffer buffer);
 
-   /**
-    * Documented at {@link LibaioFile#write(long, int, java.nio.ByteBuffer, SubmitInfo)}.
-    */
-   native void submitWrite(int fd,
-                           ByteBuffer libaioContext,
-                           long position,
-                           int size,
-                           ByteBuffer bufferWrite,
-                           Callback callback) throws IOException;
+   private static native void submitWrite(int fd,
+                                          long ioContextAddress,
+                                          long iocbAddress,
+                                          long position,
+                                          int size,
+                                          long bufferAddress,
+                                          long requestId) throws IOException;
 
-   /**
-    * Documented at {@link LibaioFile#read(long, int, java.nio.ByteBuffer, SubmitInfo)}.
-    */
-   native void submitRead(int fd,
-                          ByteBuffer libaioContext,
-                          long position,
-                          int size,
-                          ByteBuffer bufferWrite,
-                          Callback callback) throws IOException;
+   private static native void submitRead(int fd,
+                                         long ioContextAddress,
+                                         long iocbAddress,
+                                         long position,
+                                         int size,
+                                         long bufferAddress,
+                                         long requestId) throws IOException;
+
+   private static native void submitFDataSync(int fd,
+                                              long ioContextAddress,
+                                              long iocbAddress,
+                                              long requestId) throws IOException;
 
    /**
     * Note: this shouldn't be done concurrently.
@@ -441,18 +784,13 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
     * <p/>
     * The callbacks will include the original callback sent at submit (read or write).
     */
-   native int poll(ByteBuffer libaioContext, Callback[] callbacks, int min, int max);
+   private static native int poll(long ioContextAddress, long ioEventAddress, int min, int max);
 
-   /**
-    * This method will block as long as the context is open.
-    */
-   native void blockedPoll(ByteBuffer libaioContext, boolean useFdatasync);
+   private static native int getNativeVersion();
 
-   static native int getNativeVersion();
+   static native boolean lock(int fd);
 
-   public static native boolean lock(int fd);
-
-   public static native void memsetBuffer(ByteBuffer buffer, int size);
+   private static native void memsetBuffer(ByteBuffer buffer, int size);
 
    static native long getSize(int fd);
 
@@ -462,11 +800,101 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
       return getBlockSize(path.getAbsolutePath());
    }
 
+   static native long getIOContextAddress(ByteBuffer ioControl);
+
    public static native int getBlockSize(String path);
 
    static native void fallocate(int fd, long size);
 
    static native void fill(int fd, int alignment, long size);
 
-   static native void writeInternal(int fd, long position, long size, ByteBuffer bufferWrite) throws IOException;
+   static native void fdatasync(int fd);
+
+   static final class RuntimeDependent {
+
+      private static final long BUFFER_ADDRESS_FIELD_OFFSET;
+      private static final boolean HAS_UNSAFE;
+
+      static {
+         boolean hasUnsafe = hasUnsafe();
+         long bufferAddressFieldOffset = -1;
+         if (hasUnsafe) {
+            Field addressField = unsafeAddressField();
+            if (addressField != null) {
+               bufferAddressFieldOffset = unsafeAddressFiledOffset(addressField);
+               hasUnsafe = true;
+            } else {
+               bufferAddressFieldOffset = -1;
+               hasUnsafe = false;
+            }
+         }
+         BUFFER_ADDRESS_FIELD_OFFSET = bufferAddressFieldOffset;
+         HAS_UNSAFE = hasUnsafe;
+      }
+
+      private static boolean hasUnsafe() {
+         try {
+            Unsafe unsafe = UnsafeAccess.UNSAFE;
+            if (unsafe == null) {
+               throw new NullPointerException();
+            }
+            return true;
+         } catch (Throwable t) {
+            return false;
+         }
+      }
+
+      private static long unsafeAddressFiledOffset(Field addressField) {
+         Objects.requireNonNull(addressField);
+         return UnsafeAccess.UNSAFE.objectFieldOffset(addressField);
+      }
+
+      private static Field unsafeAddressField() {
+         ByteBuffer direct = ByteBuffer.allocateDirect(1);
+         final Object maybeAddressField = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+            @Override
+            public Object run() {
+               try {
+                  final Field field = Buffer.class.getDeclaredField("address");
+                  // Use Unsafe to read value of the address field. This way it will not fail on JDK9+ which
+                  // will forbid changing the access level via reflection.
+                  final long offset = UnsafeAccess.UNSAFE.objectFieldOffset(field);
+                  final long address = UnsafeAccess.UNSAFE.getLong(direct, offset);
+
+                  // if direct really is a direct buffer, address will be non-zero
+                  if (address == 0) {
+                     return null;
+                  }
+                  return field;
+               } catch (NoSuchFieldException e) {
+                  return e;
+               } catch (SecurityException e) {
+                  return e;
+               }
+            }
+         });
+
+         if (maybeAddressField instanceof Field) {
+            return (Field) maybeAddressField;
+         } else {
+            return null;
+         }
+      }
+
+      public static <T> Queue<T> newMpmcQueue(int capacity) {
+         capacity = Math.max(2, capacity);
+         return HAS_UNSAFE ? new MpmcArrayQueue<>(capacity) : new MpmcAtomicArrayQueue<>(capacity);
+      }
+
+      public static long directBufferAddress(ByteBuffer byteBuffer) {
+         if (HAS_UNSAFE) {
+            return unsafeDirectBufferAddress(byteBuffer);
+         }
+         return memoryAddress0(byteBuffer);
+      }
+
+      private static long unsafeDirectBufferAddress(ByteBuffer buffer) {
+         return UnsafeAccess.UNSAFE.getLong(buffer, BUFFER_ADDRESS_FIELD_OFFSET);
+      }
+   }
 }
