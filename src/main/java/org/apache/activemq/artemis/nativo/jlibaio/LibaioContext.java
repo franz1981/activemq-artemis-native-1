@@ -504,6 +504,9 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
       return events;
    }
 
+   private static final boolean ZERO_COPY =
+      Boolean.valueOf(System.getProperty("libaio.zero.copy", Boolean.TRUE.toString()));
+
    private int lastFile = -1;
    private boolean stop;
 
@@ -578,14 +581,18 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
          while (true) {
             int events = 0;
             if (aioRing != null) {
-               lastFile = -1;
-               // we need to limit max, because that's the capacity of ioEventArray
-               events = aioRing.poll(callback, 0, queueSize);
-               if (stop) {
-                  return;
-               }
-               if (events > 0) {
-                  continue;
+               if (ZERO_COPY) {
+                  lastFile = -1;
+                  // we need to limit max, because that's the capacity of ioEventArray
+                  events = aioRing.poll(callback, 0, queueSize);
+                  if (stop) {
+                     return;
+                  }
+                  if (events > 0) {
+                     continue;
+                  }
+               } else {
+                  events = aioRing.poll(ioEventArrayAddress, 0, queueSize);
                }
             }
             // it could be either a RHEL bug or no new events
