@@ -55,9 +55,10 @@ public final class IoEventArray {
    // Flyweight approach: this could use Unsafe too ;)
    public final class IoEvent {
 
-      private static final int DATA_OFFSET = 0;
-      private static final int OBJ_OFFSET = DATA_OFFSET + 8;
-      private static final int RES_OFFSET = OBJ_OFFSET + 8;
+      static final int DATA_OFFSET = 0;
+      static final int OBJ_OFFSET = DATA_OFFSET + 8;
+      static final int RES_OFFSET = OBJ_OFFSET + 8;
+      static final int RES2_OFFSET = RES_OFFSET + 8;
       private int offset;
 
       private IoEvent() {

@@ -99,6 +99,51 @@ public final class AioRing {
       return available;
    }
 
+   public interface AioRingCompletionCallback {
+
+      void handle(long data, long obj, long res, long res2);
+   }
+
+   public int poll(AioRingCompletionCallback callback, int min, int max) {
+      final long nrAddress = this.nrAddress;
+      final long headAddress = this.headAddress;
+      final long tailAddress = this.tailAddress;
+      final long ioEventsAddress = this.ioEventsAddress;
+      final int nr = UNSAFE.getInt(nrAddress);
+      int head = UNSAFE.getInt(headAddress);
+      // no need of membar here because Unsafe::getInt already provide it
+      final int tail = UNSAFE.getIntVolatile(null, tailAddress);
+      int available = tail - head;
+      if (available < 0) {
+         // a wrap has occurred
+         available += nr;
+      }
+      if (available < min) {
+         return 0;
+      }
+      if (available == 0) {
+         return 0;
+      }
+      // this is to mitigate a RHEL BUG: see native code for more info
+      if (available > nr) {
+         return -1;
+      }
+      available = Math.min(available, max);
+
+      for (int i = 0; i < available; i++) {
+         final long ioEvent = ioEventsAddress + (head * SIZE_OF_IO_EVENT_STRUCT);
+         final long data = UNSAFE.getLong(ioEvent + IoEventArray.IoEvent.DATA_OFFSET);
+         final long obj = UNSAFE.getLong(ioEvent + IoEventArray.IoEvent.OBJ_OFFSET);
+         final long res = UNSAFE.getLong(ioEvent + IoEventArray.IoEvent.RES_OFFSET);
+         final long res2 = UNSAFE.getLong(ioEvent + IoEventArray.IoEvent.RES2_OFFSET);
+         head++;
+         head = head >= nr ? 0 : head;
+         UNSAFE.putOrderedInt(null, headAddress, head);
+         callback.handle(data, obj, res, res2);
+      }
+      return available;
+   }
+
    public int poll(long completedIoEvents, int min, int max) {
       final long nrAddress = this.nrAddress;
       final long headAddress = this.headAddress;

@@ -25,8 +25,6 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.Queue;
@@ -506,6 +504,9 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
       return events;
    }
 
+   private int lastFile = -1;
+   private boolean stop;
+
    /**
     * It will start polling and will keep doing until the context is closed.
     * This will call callbacks on {@link SubmitInfo#onError(int, String)} and
@@ -529,11 +530,63 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
          final int queueSize = this.queueSize;
          final long ioContextAddress = this.ioContextAddress;
          final long ioEventArrayAddress = ioEventArray.address();
+         // we use a local lambda to allow true final fields thanks to the captured context
+         final AioRing.AioRingCompletionCallback callback = (data, obj, res, res2) -> {
+            assert obj != 0;
+            final int id = (int) data;
+            PooledIOCB pooledIOCB = iocbArray[id];
+            assert obj == pooledIOCB.address;
+            assert IoCb.aioData(pooledIOCB.bytes) == id;
+            final SubmitInfo submitInfo = pooledIOCB.submitInfo;
+            if (submitInfo != null) {
+               pooledIOCB.submitInfo = null;
+            }
+            if (res >= 0) {
+               final int fd = IoCb.aioFildes(pooledIOCB.bytes);
+               if (fd != dumbFD) {
+                  if (useFdatasync) {
+                     if (lastFile != fd) {
+                        lastFile = fd;
+                        // anticipate these operations to release both earlier
+                        iocbPool.add(pooledIOCB);
+                        if (ioSpace != null) {
+                           ioSpace.release();
+                        }
+                        pooledIOCB = null;
+                        fdatasync(fd);
+                     }
+                  }
+               } else {
+                  stop = true;
+               }
+            }
+            if (pooledIOCB != null) {
+               iocbPool.add(pooledIOCB);
+               if (ioSpace != null) {
+                  ioSpace.release();
+               }
+            }
+            if (submitInfo != null) {
+               if (res >= 0) {
+                  submitInfo.done();
+               } else {
+                  // TODO the error string can be cached?
+                  submitInfo.onError((int) -res, strError(res));
+               }
+            }
+         };
          while (true) {
             int events = 0;
             if (aioRing != null) {
+               lastFile = -1;
                // we need to limit max, because that's the capacity of ioEventArray
-               events = aioRing.poll(ioEventArrayAddress, 0, queueSize);
+               events = aioRing.poll(callback, 0, queueSize);
+               if (stop) {
+                  return;
+               }
+               if (events > 0) {
+                  continue;
+               }
             }
             // it could be either a RHEL bug or no new events
             if (events <= 0) {
@@ -547,7 +600,7 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
                final IoEventArray.IoEvent ioEvent = ioEventArray.get(i);
                assert ioEvent.obj() != 0;
                final int id = (int) ioEvent.data();
-               final PooledIOCB pooledIOCB = iocbArray[id];
+               PooledIOCB pooledIOCB = iocbArray[id];
                assert ioEvent.obj() == pooledIOCB.address;
                assert IoCb.aioData(pooledIOCB.bytes) == id;
                final SubmitInfo submitInfo = pooledIOCB.submitInfo;
@@ -561,6 +614,12 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
                      if (useFdatasync) {
                         if (lastFile != fd) {
                            lastFile = fd;
+                           // anticipate these operations to release both earlier
+                           iocbPool.add(pooledIOCB);
+                           if (ioSpace != null) {
+                              ioSpace.release();
+                           }
+                           pooledIOCB = null;
                            fdatasync(fd);
                         }
                      }
@@ -568,9 +627,11 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
                      stop = true;
                   }
                }
-               iocbPool.add(pooledIOCB);
-               if (ioSpace != null) {
-                  ioSpace.release();
+               if (pooledIOCB != null) {
+                  iocbPool.add(pooledIOCB);
+                  if (ioSpace != null) {
+                     ioSpace.release();
+                  }
                }
                if (submitInfo != null) {
                   if (res >= 0) {
