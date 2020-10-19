@@ -33,6 +33,7 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <limits.h>
+#include <string.h>
 #include "org_apache_activemq_artemis_nativo_jlibaio_LibaioContext.h"
 #include "exception_helper.h"
 
@@ -155,12 +156,22 @@ static inline int ringio_get_events(io_context_t aio_ctx, long min_nr, long max,
             }
 
             const int available_nr = available < max? available : max;
-            for (int i = 0; i<available_nr; i++) {
-                head = head >= ring_nr ? 0 : head;
-                events[i] = ring->io_events[head];
-                head++;
+            unsigned start = head;
+            head += available;
+            size_t available_bytes = available * sizeof(struct io_event);
+            if (head < ring_nr) {
+                // no wrap
+                memcpy(&events[0], &ring->io_events[start], available_bytes);
+            } else {
+                head -= ring_nr;
+                unsigned trail_size = (available - head);
+                size_t trail_bytes = trail_size * sizeof(struct io_event);
+                // copy trail
+                memcpy(&events[0], &ring->io_events[start], trail_bytes);
+                // copy header
+                size_t header_bytes = available_bytes - trail_bytes;
+                memcpy(&events[trail_size], &ring->io_events[0], header_bytes);
             }
-            head = head >= ring_nr ? 0 : head;
             //it allow the kernel to build its own view of the ring buffer size
             //and push new events if there are any
             store_barrier();
