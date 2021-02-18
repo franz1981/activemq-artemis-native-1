@@ -23,6 +23,7 @@ import java.io.IOException;
 import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.activemq.artemis.nativo.jlibaio.AioRing;
@@ -104,6 +105,31 @@ public class LibaioTest {
       File parent = new File("./target");
       parent.mkdirs();
       temporaryFolder = new TemporaryFolder(parent);
+   }
+
+   @Test
+   public void testWakeupBlockedPoll() throws InterruptedException, IOException {
+      for (int i = 0; i< 10; i++) {
+         final CountDownLatch awake = new CountDownLatch(1);
+         final CountDownLatch readyToWakeup = new CountDownLatch(1);
+         final SubmitInfo[] callbacks = new TestInfo[1];
+         Thread blocked = new Thread(() -> {
+            readyToWakeup.countDown();
+            System.out.println("POLL!");
+            int events = control.poll(callbacks, 1, 1);
+            awake.countDown();
+         });
+         blocked.start();
+         try {
+            readyToWakeup.await();
+            TimeUnit.SECONDS.sleep(4);
+            System.out.println("WAKE UP!");
+            control.wakeup();
+            Assert.assertTrue(awake.await(1, TimeUnit.MINUTES));
+         } finally {
+            blocked.interrupt();
+         }
+      }
    }
 
    @Test

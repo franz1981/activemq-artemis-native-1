@@ -26,7 +26,6 @@ import java.nio.ByteOrder;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
 import java.util.ArrayDeque;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.Queue;
@@ -189,6 +188,9 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
    private final AioRing aioRing;
    private final int dumbFD;
    private final ReentrantLock pollLock;
+   private final int eventFd;
+   private final ByteBuffer eventfdBuf;
+   private static final int EVENT_FD_ID = 0;
 
    /**
     * The queue size here will use resources defined on the kernel parameter
@@ -202,13 +204,17 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
    public LibaioContext(int queueSize, boolean useSemaphore, boolean useFdatasync) {
       try {
          contexts.incrementAndGet();
-         this.ioControl = newContext(queueSize);
+         this.ioControl = newContext(queueSize + 1);
          // Better use JNI here, because the context address size depends on the machine word size
          this.ioContextAddress = getIOContextAddress(ioControl);
          this.iocbPool = RuntimeDependent.newMpmcQueue(queueSize);
-         this.iocbArray = new PooledIOCB[queueSize];
-         final IoCb.Array arrayOfIocb = new IoCb.Array(queueSize);
-         for (int i = 0; i < queueSize; i++) {
+         this.iocbArray = new PooledIOCB[queueSize + 1];
+         final IoCb.Array arrayOfIocb = new IoCb.Array(queueSize + 1);
+         this.iocbArray[EVENT_FD_ID] = new PooledIOCB(EVENT_FD_ID, arrayOfIocb.sliceOf(EVENT_FD_ID));
+         for (int i = 0; i < queueSize + 1; i++) {
+            if (i == EVENT_FD_ID) {
+               continue;
+            }
             final PooledIOCB pooledIOCB = new PooledIOCB(i, arrayOfIocb.sliceOf(i));
             this.iocbArray[i] = pooledIOCB;
             this.iocbPool.add(pooledIOCB);
@@ -227,6 +233,21 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
          this.ioSpace = new Semaphore(queueSize);
       } else {
          this.ioSpace = null;
+      }
+      try {
+         eventFd = notBlockingEventFd();
+         eventfdBuf = ByteBuffer.allocateDirect(Long.BYTES);
+      } catch (IOException e) {
+         throw new RuntimeException(e);
+      }
+   }
+
+   public void wakeup() {
+      try {
+         submitRead(eventFd, ioContextAddress, iocbArray[EVENT_FD_ID].address, 0, Long.BYTES,
+                    RuntimeDependent.directBufferAddress(eventfdBuf), EVENT_FD_ID);
+      } catch (IOException e) {
+         throw new IllegalStateException(e);
       }
    }
 
@@ -362,6 +383,7 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
                iocbPool.clear();
                Arrays.fill(iocbArray, null);
                ioEventArray.close();
+               close(eventFd);
             } finally {
                pollLock.unlock();
             }
@@ -485,9 +507,11 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
          // NOTE:
          // First we return back the IOCB then we release the semaphore, to let submitInfo::done
          // to be able to issue a further write/read.
-         iocbPool.add(pooledIOCB);
-         if (ioSpace != null) {
-            ioSpace.release();
+         if (id != EVENT_FD_ID) {
+            iocbPool.add(pooledIOCB);
+            if (ioSpace != null) {
+               ioSpace.release();
+            }
          }
          if (callbacks != null) {
             // this could be NULL!
@@ -753,6 +777,10 @@ public class LibaioContext<Callback extends SubmitInfo> implements Closeable {
     * @return a fd from open C call.
     */
    public static native int open(String path, boolean direct);
+
+   public static native void eventFdWrite(int fd, long value) throws IOException;
+
+   public static native int notBlockingEventFd() throws IOException;
 
    public static native void close(int fd);
 

@@ -29,7 +29,7 @@
 #include <sys/types.h>
 #include <sys/file.h>
 #include <sys/stat.h>
-#include <fcntl.h>
+#include <sys/eventfd.h>
 #include <stdlib.h>
 #include <pthread.h>
 #include <limits.h>
@@ -386,6 +386,28 @@ static inline struct io_control * getIOControl(JNIEnv* env, jobject pointer) {
 
 JNIEXPORT jlong JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioContext_getIOContextAddress(JNIEnv* env, jclass clazz, jobject ioControlBuffer) {
     return (jlong) (getIOControl(env, ioControlBuffer)->ioContext);
+}
+
+JNIEXPORT jint JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioContext_notBlockingEventFd(JNIEnv* env, jclass clazz) {
+    // We use a blocking fd with io_uring FAST_POLL read
+    jint eventFD = eventfd(0, EFD_CLOEXEC | O_NONBLOCK);
+
+    if (eventFD < 0) {
+        throwIOExceptionErrorNo(env, "Error closing file:", eventFD);
+    }
+    return eventFD;
+}
+
+JNIEXPORT void JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioContext_eventFdWrite(JNIEnv* env, jclass clazz, jint fd, jlong value) {
+    int result;
+    int err;
+    do {
+        result = eventfd_write(fd, (eventfd_t) value);
+        if (result >= 0) {
+            return;
+        }
+    } while ((err = errno) == EINTR);
+    throwIOExceptionErrorNo(env, "Error closing file:", err);
 }
 
 static inline short submit(JNIEnv * env, io_context_t io_context, struct iocb * iocb) {

@@ -9,6 +9,8 @@ extern "C" {
 #endif
 #undef org_apache_activemq_artemis_nativo_jlibaio_LibaioContext_EXPECTED_NATIVE_VERSION
 #define org_apache_activemq_artemis_nativo_jlibaio_LibaioContext_EXPECTED_NATIVE_VERSION 11L
+#undef org_apache_activemq_artemis_nativo_jlibaio_LibaioContext_EVENT_FD_ID
+#define org_apache_activemq_artemis_nativo_jlibaio_LibaioContext_EVENT_FD_ID 0L
 /*
  * Class:     org_apache_activemq_artemis_nativo_jlibaio_LibaioContext
  * Method:    shutdownHook
@@ -80,6 +82,22 @@ JNIEXPORT void JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioCon
  */
 JNIEXPORT jint JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioContext_open
   (JNIEnv *, jclass, jstring, jboolean);
+
+/*
+ * Class:     org_apache_activemq_artemis_nativo_jlibaio_LibaioContext
+ * Method:    eventFdWrite
+ * Signature: (IJ)V
+ */
+JNIEXPORT void JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioContext_eventFdWrite
+  (JNIEnv *, jclass, jint, jlong);
+
+/*
+ * Class:     org_apache_activemq_artemis_nativo_jlibaio_LibaioContext
+ * Method:    notBlockingEventFd
+ * Signature: ()I
+ */
+JNIEXPORT jint JNICALL Java_org_apache_activemq_artemis_nativo_jlibaio_LibaioContext_notBlockingEventFd
+  (JNIEnv *, jclass);
 
 /*
  * Class:     org_apache_activemq_artemis_nativo_jlibaio_LibaioContext
